@@ -9,13 +9,12 @@ from operator import itemgetter
 from json import loads
 import ipywidgets as widgets
 
-#I'm not sure if this changes...
-deepRacerSimAppId = 'deepracer-simapp-1c7297c6-1289-4ea2-bdf2-f91a0e7bdec1'
 autoParams = {}
 
 def get_robo_maker_jobs():
     rmclient = boto3.client('robomaker')
     # Get the list of RoboMaker simulation jobs that were used for DeepRacer
+    deepRacerSimAppId = rmclient.list_simulation_applications()['simulationApplicationSummaries'][0]['name']
     response = rmclient.list_simulation_jobs(
         maxResults=100,
         filters=[
