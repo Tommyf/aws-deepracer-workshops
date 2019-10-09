@@ -11,7 +11,7 @@ import ipywidgets as widgets
 
 autoParams = {}
 
-def get_robo_maker_jobs():
+def get_robo_maker_jobs(jobsType='training'):
     rmclient = boto3.client('robomaker')
     # Get the list of RoboMaker simulation jobs that were used for DeepRacer
     deepRacerSimAppId = rmclient.list_simulation_applications()['simulationApplicationSummaries'][0]['name']
@@ -27,11 +27,19 @@ def get_robo_maker_jobs():
         ]
     )
     rmjobs = response['simulationJobSummaries']
-
+    allJobs={}
+    allJobs['training'] = []
+    allJobs['evaluation'] = []
     # Also get the summaries for each job and add that into the array
     for job in rmjobs:
         # Get & populate job summary
         job['summary'] = rmclient.describe_simulation_job(job=job['arn'])
+
+        if job['summary']['simulationApplications'][0]['launchConfig']['launchFile'] == "distributed_training.launch":
+            job['type'] = "training"
+        elif job['summary']['simulationApplications'][0]['launchConfig']['launchFile'] == "evaluation.launch":
+            job['type'] = "evaluation"
+
         job['id'] = job['arn'].partition("/")[-1]
         if 'lastStartedAt' in job['summary'].keys():
             job['startTime'] = job['summary']['lastStartedAt']
@@ -39,11 +47,25 @@ def get_robo_maker_jobs():
             job['startTime'] = None
         job['maxduration'] = job['summary']['maxJobDurationInSeconds']
         job['track'] = job['summary']['simulationApplications'][0]['launchConfig']['environmentVariables']['WORLD_NAME']
-    
+
+        if job['type'] == "training" and job['status'] != "Failed":
+            # Get location of metadata (action space) and hyperparams
+            job['metadataS3bucket'] = job['summary']['simulationApplications'][0]['launchConfig']['environmentVariables']['METRICS_S3_BUCKET']
+            job['metadatafilekey'] = job['summary']['simulationApplications'][0]['launchConfig']['environmentVariables']['MODEL_METADATA_FILE_S3_KEY']
+        
+            job['hyperparamsS3bucket'] = job['summary']['simulationApplications'][0]['launchConfig']['environmentVariables']['SAGEMAKER_SHARED_S3_BUCKET']
+            job['hyperparamsfilekey'] = "{}/ip/hyperparameters.json".format(job['summary']['simulationApplications'][0]['launchConfig']['environmentVariables']['SAGEMAKER_SHARED_S3_PREFIX'])
+
+            # Download and ingest metadata and hyperparams
+            s3 = boto3.resource('s3')
+            job['actionspace'] = loads(s3.Object(job['metadataS3bucket'], job['metadatafilekey']).get()['Body'].read().decode('utf-8'))['action_space']
+            job['hyperparams'] = loads(s3.Object(job['hyperparamsS3bucket'], job['hyperparamsfilekey']).get()['Body'].read().decode('utf-8'))
+        
         # Create a description for the widget.
-        job['desc'] = "{} - Track: {} - Duration: {}".format(job['id'],job['track'],job['maxduration']/60)
+        job['desc'] = "{} - Type: {} - Track: {} - Duration: {}".format(job['id'],job['type'],job['track'],job['maxduration']/60)
+        allJobs[job['type']].append(job)
     
-    return rmjobs
+    return allJobs[jobsType]
 
 def get_job(jobsList,jobID):
     return list(filter(lambda job: job['id'] == jobID, jobsList))[0]
@@ -76,26 +98,38 @@ def display_job_selection_widget():
         selectedJob = list(filter(lambda job: job['id'] == simSelectWidget.value, allJobs))[0]
         selectedJobID = selectedJob['id']
         track = selectedJob['track']
-        hyperParameters = get_hyper_parameters(stream_prefix=selectedJob['id'])
 
         with output:
             output.clear_output()
             print("Job ID: {}\t""Track: {}\n"
                   "Max Run Time: {}\t\tStart Time: {}\n"
-                  "Status: {}".format(selectedJobID,
+                  "Status: {}\n".format(selectedJobID,
                                       track,
                                       selectedJob['maxduration']/60,
                                       selectedJob['startTime'],
                                       selectedJob['status']
                                       ))
 
-            print("Hyperparameters:\nBatch Size:\t\t\t{}\n"
-                  "Entropy:\t\t\t{}\n"
-                  "Discount Factor:\t\t{}\n"
-                  "Loss Type:\t\t\t{}\n"
-                  "Learning Rate:\t\t\t{}\n"
-                  "Episodes per iteration\t\t{}\n"
-                  "No Epochs\t\t\t{}\n".format(hyperParameters['batch_size'],
+            if 'actionspace' in selectedJob.keys():
+                actionSpace = selectedJob['actionspace']
+                autoParams['actionSpace'] = actionSpace
+                print("Action Space:\nIndex")
+                print("{: >10} {:>15.3} {: >10}".format("Index","Angle","Speed"))
+                for action in actionSpace:
+                    print("{: >10} {:>15f} {: >10}".format(action['index'],action['steering_angle'],action['speed']))
+                print("\n")
+
+
+            if 'hyperparams' in selectedJob.keys():
+                hyperParameters = selectedJob['hyperparams']
+                autoParams['hyperParameters'] = hyperParameters
+                print("Hyperparameters:\nBatch Size:\t\t\t{}\n"
+                    "Entropy:\t\t\t{}\n"
+                    "Discount Factor:\t\t{}\n"
+                    "Loss Type:\t\t\t{}\n"
+                    "Learning Rate:\t\t\t{}\n"
+                    "Episodes per iteration\t\t{}\n"
+                    "No Epochs\t\t\t{}\n".format(hyperParameters['batch_size'],
                                             hyperParameters['beta_entropy'],
                                             hyperParameters['discount_factor'],
                                             hyperParameters['loss_type'],
@@ -103,11 +137,11 @@ def display_job_selection_widget():
                                             hyperParameters['num_episodes_between_training'],
                                             hyperParameters['num_epochs'],
                                             ))
-
+            
         autoParams['selectedJob'] = selectedJob
         autoParams['selectedJobID'] = selectedJobID
         autoParams['track'] = track
-        autoParams['hyperParameters'] = hyperParameters
+        
             
     button.on_click(on_button_clicked)
 
@@ -115,45 +149,4 @@ def get_auto_params():
     global autoParams
     return autoParams
 
-def get_hyper_parameters(log_group=None, stream_name=None, stream_prefix=None, start_time=None, end_time=None):
-    client = boto3.client('logs')
-
-    if start_time is None:
-        start_time = 1451490400000  # 2018
-    if end_time is None:
-        end_time = 2000000000000  # 2033 #arbitrary future date
-    if log_group is None:
-        log_group = "/aws/robomaker/SimulationJobs"
-
-    if stream_name is None and stream_prefix is None:
-        print("Both stream name and prefix can't be None")
-        return
-
-    if stream_prefix:
-        kwargs = {
-            'logStreamNamePrefix': stream_prefix,
-        }
-    else:
-        kwargs = {
-            'logStreamNames': [stream_name],
-        }
-
-    kwargs['logGroupName'] = log_group
-    kwargs['limit'] = 10000
-    kwargs['startTime'] = start_time
-    kwargs['endTime'] = end_time
-
-    resp = client.filter_log_events(**kwargs)
-    parsingHyperParams = False
-    hyperParamsRaw=""
-    for event in resp['events']:
-        if parsingHyperParams:
-            hyperParamsRaw += event['message']
-            if event['message'] == "}":
-                parsingHyperParams = False
-        elif event['message'] == 'Using the following hyper-parameters':
-            parsingHyperParams = True
-    if hyperParamsRaw == "":
-        hyperParamsRaw = "{}"
-    return loads(hyperParamsRaw)
 
